@@ -1,0 +1,3 @@
+```release-note:bug
+scheduler: Fixed a bug where replacements for lost allocations were not placed, and rescheduled allocations were placed twice instead, when the deployment was paused, failed, or running canaries
+```

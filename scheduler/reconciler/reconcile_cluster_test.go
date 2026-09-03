@@ -7627,3 +7627,95 @@ func TestReconciler_ScaleDown_ClientTerminal_Service_ActiveDeployment(t *testing
 		must.Eq(t, stop.Alloc.ID, allocs[2].ID)
 	}
 }
+
+// Tests that when a deployment is not ready for placements (here: paused) and
+// the group has both lost allocs and allocs that must be rescheduled now, the
+// replacements added for the lost allocs are the ones computePlacements built
+// for them, rather than a leading slice of the placement list that actually
+// holds the rescheduled placements.
+func TestReconciler_PausedDeployment_LostAndRescheduleNow(t *testing.T) {
+	ci.Parallel(t)
+
+	now := time.Now()
+
+	job := mock.Job()
+	job.TaskGroups[0].Count = 6
+	tgName := job.TaskGroups[0].Name
+	job.TaskGroups[0].Update = noCanaryUpdate
+	job.TaskGroups[0].ReschedulePolicy = &structs.ReschedulePolicy{
+		Attempts:      1,
+		Interval:      24 * time.Hour,
+		Delay:         5 * time.Second,
+		DelayFunction: "constant",
+		MaxDelay:      1 * time.Hour,
+		Unlimited:     false,
+	}
+
+	d := structs.NewDeployment(job, 50, now.UnixNano())
+	d.Status = structs.DeploymentStatusPaused
+	d.TaskGroups[tgName] = &structs.DeploymentState{
+		Promoted:     true,
+		DesiredTotal: 6,
+		PlacedAllocs: 5,
+	}
+
+	// Five of the six allocs exist, so there is room for a replacement.
+	var allocs []*structs.Allocation
+	for i := range 5 {
+		alloc := mock.Alloc()
+		alloc.Job = job
+		alloc.JobID = job.ID
+		alloc.NodeID = uuid.Generate()
+		alloc.Name = structs.AllocName(job.ID, tgName, uint(i))
+		alloc.TaskGroup = tgName
+		alloc.DeploymentID = d.ID
+		alloc.ClientStatus = structs.AllocClientStatusRunning
+		allocs = append(allocs, alloc)
+	}
+
+	// Alloc 0 failed and is eligible to reschedule now. Allocs that belong to
+	// an active deployment only reschedule when explicitly marked eligible.
+	allocs[0].ClientStatus = structs.AllocClientStatusFailed
+	allocs[0].DesiredTransition.Reschedule = new(true)
+	allocs[0].TaskStates = map[string]*structs.TaskState{tgName: {
+		State:      structs.TaskStateDead,
+		StartedAt:  now.Add(-1 * time.Hour),
+		FinishedAt: now.Add(-10 * time.Second),
+	}}
+
+	// Alloc 1 sits on a node that is down, so it is lost.
+	downNode := mock.Node()
+	downNode.ID = allocs[1].NodeID
+	downNode.Status = structs.NodeStatusDown
+	tainted := map[string]*structs.Node{downNode.ID: downNode}
+
+	reconciler := NewAllocReconciler(
+		testlog.HCLogger(t), allocUpdateFnIgnore, ReconcilerState{
+			JobIsBatch:        false,
+			JobID:             job.ID,
+			Job:               job,
+			DeploymentCurrent: d,
+			DeploymentPaused:  true,
+			ExistingAllocs:    allocs,
+			EvalPriority:      50,
+		}, ClusterState{
+			TaintedNodes: tainted,
+			Now:          now.UTC(),
+		})
+	r := reconciler.Compute()
+
+	// One replacement for the lost alloc (index 1) and one for the rescheduled
+	// alloc (index 0). Before the fix both placements were for index 0 and the
+	// lost alloc was never replaced.
+	must.Len(t, 2, r.Place)
+	assertNamesHaveIndexes(t, intRange(0, 1), placeResultsToNames(r.Place))
+
+	var lostReplacements int
+	for _, p := range r.Place {
+		if p.PreviousLost() {
+			lostReplacements++
+			must.Eq(t, allocs[1].ID, p.PreviousAllocation().ID)
+		}
+	}
+	must.Eq(t, 1, lostReplacements)
+}

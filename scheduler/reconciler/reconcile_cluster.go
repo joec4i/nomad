@@ -936,10 +936,19 @@ func (a *AllocReconciler) placeAllocs(deploymentPlaceReady bool, desiredChanges 
 
 	// If allocs have been lost, determine the number of replacements that are needed
 	// and add placements to the result for the lost allocs.
+	// Select the placements computePlacements actually created for the lost
+	// allocs. They are identified by PreviousLost, not by position: rescheduled
+	// placements are prepended to the same slice, so a leading slice of len(lost)
+	// entries picks up rescheduled placements instead, which are then appended a
+	// second time by the loop below.
 	if len(lost) != 0 {
-		allowed := min(len(lost), len(place))
-		desiredChanges.Place += uint64(allowed)
-		resultingPlacements = append(resultingPlacements, place[:allowed]...)
+		for _, p := range place {
+			if !p.PreviousLost() {
+				continue
+			}
+			desiredChanges.Place++
+			resultingPlacements = append(resultingPlacements, p)
+		}
 	}
 
 	// if no failures or there are no pending placements return.
