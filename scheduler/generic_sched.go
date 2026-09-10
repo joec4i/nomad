@@ -653,8 +653,12 @@ func (s *GenericScheduler) computePlacements(destructive, place []placementResul
 				// future version of Nomad.
 				if taskGroupNameIndex.IsDuplicate(allocIndex) {
 					oldAllocName := newAllocName
-					newAllocName = taskGroupNameIndex.Next(1)[0]
+					// Release the duplicated index before asking for a
+					// replacement, otherwise Next cannot offer the slot this
+					// allocation is vacating and may hand back the very index
+					// we are trying to escape.
 					taskGroupNameIndex.UnsetIndex(allocIndex)
+					newAllocName = taskGroupNameIndex.Next(1)[0]
 					s.logger.Debug("duplicate alloc index found and changed",
 						"old_alloc_name", oldAllocName, "new_alloc_name", newAllocName)
 				}

@@ -548,7 +548,15 @@ func (a *allocReconciler) computeGroup(groupName string, all allocSet) bool {
 	// include stopped allocations.
 	isCanarying := dstate != nil && dstate.DesiredCanaries != 0 && !dstate.Promoted
 
-	stop := a.computeStop(tg, nameIndex, untainted, migrate, lost, canaries, isCanarying, lostLaterEvals)
+	// The retention bound comes from the deployment state, the same source
+	// isCanarying is derived from, so the two can never disagree.
+	canaryLimit := 0
+	if dstate != nil {
+		canaryLimit = dstate.DesiredCanaries
+	}
+
+	stop := a.computeStop(tg, nameIndex, untainted, migrate, lost, canaries,
+		isCanarying, canaryLimit, lostLaterEvals)
 
 	desiredChanges.Stop += uint64(len(stop))
 	untainted = untainted.difference(stop)
@@ -1022,7 +1030,8 @@ func (a *allocReconciler) isDeploymentComplete(groupName string, destructive, in
 // the group definition, the set of allocations in various states and whether we
 // are canarying.
 func (a *allocReconciler) computeStop(group *structs.TaskGroup, nameIndex *allocNameIndex,
-	untainted, migrate, lost, canaries allocSet, isCanarying bool, followupEvals map[string]string) allocSet {
+	untainted, migrate, lost, canaries allocSet, isCanarying bool, canaryLimit int,
+	followupEvals map[string]string) allocSet {
 
 	// Mark all lost allocations for stop.
 	var stop allocSet
@@ -1030,9 +1039,19 @@ func (a *allocReconciler) computeStop(group *structs.TaskGroup, nameIndex *alloc
 
 	a.markDelayed(lost, structs.AllocClientStatusLost, allocLost, followupEvals)
 
-	// If we are still deploying or creating canaries, don't stop them
+	// An unpromoted deployment may retain no more than the configured number
+	// of live canaries. PlacedCanaries is cumulative -- allocation IDs are
+	// appended when a canary is placed and never removed -- so it must not
+	// exempt an unbounded number of live allocations from count
+	// reconciliation. Stop the overflow explicitly, then exempt only the
+	// bounded retained set.
 	if isCanarying {
-		untainted = untainted.difference(canaries)
+		retained, excess := limitLiveCanaries(canaries, canaryLimit)
+
+		a.markStop(excess, "", allocNotNeeded)
+		stop = stop.union(excess)
+
+		untainted = untainted.difference(retained, excess)
 	}
 
 	// Remove disconnected allocations so they won't be stopped
@@ -1251,6 +1270,57 @@ func (a *allocReconciler) reconcileReconnecting(reconnecting allocSet, all alloc
 	}
 
 	return reconnect, stop
+}
+
+// limitLiveCanaries splits a task group's recognized canaries into the set to
+// retain and the set that overflows the configured canary count.
+//
+// A deployment's PlacedCanaries list grows every time a canary is placed and
+// is never pruned, so the recognized canary set can hold many live generations
+// of the same canary. Successive generations normally reuse the same
+// allocation names, so duplicates are resolved by name first: retaining the
+// newest five arbitrary IDs could otherwise keep several generations of one
+// name while dropping the only canary of another.
+//
+// Only running canaries are eligible to be excess; see the comment inline.
+// Everything not selected as excess stays in the retained set, so the caller's
+// exemption behaviour for those allocations is unchanged.
+func limitLiveCanaries(canaries allocSet, limit int) (retained, excess allocSet) {
+	excess = make(allocSet)
+
+	// Only running canaries compete for the retention slots, and only they
+	// can be selected as excess. A pending canary has not started yet and an
+	// unknown one is mid-disconnect; neither is a settled generation, and
+	// stopping them would cut across the disconnect and reschedule handling
+	// that owns them. Terminal canaries are already stopped.
+	live := make([]*structs.Allocation, 0, len(canaries))
+	for _, alloc := range canaries {
+		if alloc.ClientStatus == structs.AllocClientStatusRunning &&
+			!alloc.TerminalStatus() {
+			live = append(live, alloc)
+		}
+	}
+
+	// Newest first, deterministically: CreateIndex descending with the
+	// allocation ID as the tie-breaker.
+	sort.Slice(live, func(i, j int) bool {
+		if live[i].CreateIndex != live[j].CreateIndex {
+			return live[i].CreateIndex > live[j].CreateIndex
+		}
+		return live[i].ID > live[j].ID
+	})
+
+	seenNames := make(map[string]struct{}, len(live))
+	for _, alloc := range live {
+		_, duplicateName := seenNames[alloc.Name]
+		if duplicateName || len(seenNames) >= limit {
+			excess[alloc.ID] = alloc
+			continue
+		}
+		seenNames[alloc.Name] = struct{}{}
+	}
+
+	return canaries.difference(excess), excess
 }
 
 // computeUpdates determines which allocations for the passed group require
