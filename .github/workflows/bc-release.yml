@@ -1,0 +1,78 @@
+# Builds a patched Nomad release for BigCommerce's fpm-cookery nomad package.
+# Lives on an orphan branch so none of upstream's workflows run alongside it.
+# To build a new release: push a tag with the patches applied, update NOMAD_TAG
+# and VERSION_METADATA below, and push this branch.
+name: bc-release
+
+on:
+  push:
+    branches: [bc-build]
+
+env:
+  NOMAD_TAG: v2.0.7+bc1
+  VERSION_METADATA: bc1
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    # Debian bookworm, so the cgo binary links against the same glibc (2.36) as
+    # the servers it is installed on.
+    container: golang:1.27.1-bookworm
+    outputs:
+      zip: ${{ steps.build.outputs.zip }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.NOMAD_TAG }}
+
+      - id: build
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          apt-get update -qq && apt-get install -qq -y zip >/dev/null
+
+          version="${NOMAD_TAG#v}"
+          commit=$(git rev-parse HEAD)
+          build_date=$(TZ=UTC0 git show -s --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ HEAD)
+
+          # Same tags, cgo and trimpath as the upstream release build.
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -tags 'ui release' \
+            -ldflags "-X github.com/hashicorp/nomad/version.GitCommit=${commit} -X github.com/hashicorp/nomad/version.BuildDate=${build_date} -X github.com/hashicorp/nomad/version.VersionMetadata=${VERSION_METADATA}" \
+            -o dist/nomad .
+
+          ./dist/nomad version
+          go version -m dist/nomad | grep -E 'go1|-tags|CGO_ENABLED|vcs'
+
+          zip="nomad_${version}_linux_amd64.zip"
+          (cd dist && zip -q -X "../${zip}" nomad)
+          sha256sum "${zip}" > "nomad_${version}_SHA256SUMS"
+          cat "nomad_${version}_SHA256SUMS"
+          echo "zip=${zip}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release
+          path: |
+            nomad_*_linux_amd64.zip
+            nomad_*_SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release
+
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="Nomad ${NOMAD_TAG%%+*} with BigCommerce patches applied, built by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}. Not an official HashiCorp release."
+          if gh release view "$NOMAD_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$NOMAD_TAG" --repo "$GITHUB_REPOSITORY" --clobber nomad_*
+          else
+            gh release create "$NOMAD_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --latest=false \
+              --title "$NOMAD_TAG" --notes "$notes" nomad_*
+          fi
