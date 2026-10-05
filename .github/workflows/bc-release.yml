@@ -9,8 +9,8 @@ on:
     branches: [bc-build]
 
 env:
-  NOMAD_TAG: v2.0.7+bc1
-  VERSION_METADATA: bc1
+  NOMAD_TAG: v2.0.7+bc2
+  VERSION_METADATA: bc2
 
 jobs:
   build:
