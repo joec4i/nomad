@@ -1,0 +1,69 @@
+# Reproduction: a node-drain migration whose replacement is not placed on the same
+# eval, while a canary deployment waits for promotion, is never replaced.
+#
+# Runs as its own compose project (-p canarydrain), published on host port 34646:
+#   - 3 Nomad servers: a Nomad leader pauses 3/4 of its scheduler workers, and
+#     num_schedulers is capped at the Docker VM's CPU count (2 here), so the leader
+#     alone has one active worker; the followers' workers stay active, which gives
+#     the evals of different jobs real parallelism
+#   - 3 Nomad clients advertising memory_total_mb = 1000 (see conf/canary-drain-partial-plan)
+#   - server log_level DEBUG
+#   - image from CDPP_NOMAD_IMAGE, default upstream hashicorp/nomad:2.1.1
+#
+#   scripts/canary-drain-partial-plan.sh all
+#
+# Always `down -v` before bringing it up again with different servers: clients keep a
+# node identity signed by the previous servers and are refused by a new cluster.
+x-nomad-server: &nomad-server
+  image: ${CDPP_NOMAD_IMAGE:-hashicorp/nomad:2.1.1}
+  command: agent -config=/etc/nomad.d/server.hcl
+  networks: [lab]
+
+x-nomad-client: &nomad-client
+  image: ${CDPP_NOMAD_IMAGE:-hashicorp/nomad:2.1.1}
+  command: agent -config=/etc/nomad.d/client.hcl
+  # All three are required for the client to manage cgroups (v2) inside a
+  # container; without them it fails with "failed to create nomad cgroup".
+  privileged: true
+  cgroup: host
+  networks: [lab]
+  depends_on: [nomad-server]
+
+services:
+  nomad-server:
+    <<: *nomad-server
+    ports:
+      - "${CDPP_NOMAD_PORT:-34646}:4646"
+    volumes:
+      - ./conf/canary-drain-partial-plan/server.hcl:/etc/nomad.d/server.hcl:ro
+
+  nomad-server2:
+    <<: *nomad-server
+    volumes:
+      - ./conf/canary-drain-partial-plan/server2.hcl:/etc/nomad.d/server.hcl:ro
+
+  nomad-server3:
+    <<: *nomad-server
+    volumes:
+      - ./conf/canary-drain-partial-plan/server3.hcl:/etc/nomad.d/server.hcl:ro
+
+  nomad-client1:
+    <<: *nomad-client
+    volumes:
+      - ./conf/canary-drain-partial-plan/client1.hcl:/etc/nomad.d/client.hcl:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+
+  nomad-client2:
+    <<: *nomad-client
+    volumes:
+      - ./conf/canary-drain-partial-plan/client2.hcl:/etc/nomad.d/client.hcl:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+
+  nomad-client3:
+    <<: *nomad-client
+    volumes:
+      - ./conf/canary-drain-partial-plan/client3.hcl:/etc/nomad.d/client.hcl:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+
+networks:
+  lab: {}
