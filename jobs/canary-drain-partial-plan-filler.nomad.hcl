@@ -8,7 +8,7 @@
 # the drain so its plan competes for the same free slot.
 variable "memory" {
   type    = number
-  default = 300
+  default = 100
 }
 
 variable "node" {

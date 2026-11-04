@@ -12,7 +12,7 @@
 #                capacity, which unblocks that eval within ~150 ms, and the re-run
 #                places 0.
 #
-# Expects docker-compose.canary-drain-partial-plan.yml; `up` and `all` start it.
+# Expects docker-compose.yml; `up` and `all` start it.
 #
 #   scripts/canary-drain-partial-plan.sh all
 #   scripts/canary-drain-partial-plan.sh up | down | clean
@@ -24,9 +24,9 @@
 #
 # How the plan-apply rejection is made (a natural race, no Nomad changes):
 #   - 3 clients advertise 1000 MB. Ballast jobs leave the migration target T with
-#     exactly one 300 MB slot free, and the other node U with two.
+#     exactly one 100 MB slot free, and the other node U with two.
 #   - The eval broker is paused, the node is drained (the drainer marks the alloc and
-#     creates the evals), a rival job (priority 70, one 300 MB alloc, any node) is
+#     creates the evals), a rival job (priority 70, one 100 MB alloc, any node) is
 #     registered, and the broker is resumed. The evals are then dequeued by different
 #     scheduler workers at the same moment, both snapshots show T's free slot, and the
 #     plan applier lets the rival's plan win it. The migration plan is then rejected
@@ -53,11 +53,12 @@ MAX_ATTEMPTS=${CDPP_MAX_ATTEMPTS:-12}
 RIVALS=${CDPP_RIVALS:-1}
 OUT=${CDPP_OUT:-out}
 JOB=canary-drain
-SLOT=300 # MB, the size of one canary-drain alloc
+SLOT=100 # MB, the size of one canary-drain alloc
+COUNT=5  # group count
 FILLER=jobs/canary-drain-partial-plan-filler.nomad.hcl
 SERVERS="nomad-server nomad-server2 nomad-server3"
 
-compose() { docker compose -p "$PROJECT" -f docker-compose.canary-drain-partial-plan.yml "$@"; }
+compose() { docker compose -p "$PROJECT" "$@"; }
 nomad() { compose exec -T nomad-server nomad "$@"; }
 get() { curl -sf "$API$1"; }
 # jq_ '<python expr over d>' reads JSON on stdin.
@@ -75,7 +76,8 @@ mkdir -p "$OUT"
 up() {
   say "starting the lab (project $PROJECT, API $API)"
   compose up -d >/dev/null 2>&1
-  wait_nodes
+  wait_nodes any
+  clean # a cluster left over from an earlier run may have a drained node or old jobs
   note "$(nomad version | head -1); $(get /v1/nodes | jq_ 'len(d)') clients ready; servers: $(nomad server members 2>/dev/null | awk 'NR>1 && NF>6 {printf "%s(%s) ", $1, ($5=="true"?"leader":"follower")}')"
   note "server log_level DEBUG; image $IMAGE"
 }
@@ -87,10 +89,11 @@ down() {
 
 node_ids() { get /v1/nodes | jq_ '" ".join(n["ID"] for n in d)'; }
 
-wait_nodes() {
-  local n
+wait_nodes() { # [any]: count nodes that are ready even if drained or ineligible
+  local n cond='n["Status"] == "ready" and n["SchedulingEligibility"] == "eligible" and not n["Drain"]'
+  [ "${1:-}" = any ] && cond='n["Status"] == "ready"'
   for _ in $(seq 1 90); do
-    n=$(get /v1/nodes 2>/dev/null | jq_ 'sum(1 for n in d if n["Status"] == "ready" and n["SchedulingEligibility"] == "eligible" and not n["Drain"])' 2>/dev/null || echo 0)
+    n=$(get /v1/nodes 2>/dev/null | jq_ "sum(1 for n in d if $cond)" 2>/dev/null || echo 0)
     [ "$n" = 3 ] && return
     sleep 2
   done
@@ -121,7 +124,7 @@ clean() {
 # ---------------------------------------------------------------- jobs and waiting
 
 run_job() { # marker
-  quiet nomad job run -detach -var "marker=$1" - < jobs/canary-drain-partial-plan.nomad.hcl
+  quiet nomad job run -detach -var "marker=$1" -var "count=$COUNT" -var "memory=$SLOT" - < jobs/canary-drain-partial-plan.nomad.hcl
 }
 
 filler() { # id priority [-var ...]
@@ -147,7 +150,7 @@ blocked_evals() { get "/v1/job/$JOB/evaluations" | jq_ 'sum(1 for e in d if e["S
 
 # v0, then v1 which starts a canary deployment that waits for promotion.
 setup_canary() {
-  say "setup: $JOB v0 (count 2), then v1 -> canary placed, not promoted"
+  say "setup: $JOB v0 (count $COUNT), then v1 -> canary placed, not promoted"
   run_job v0
   wait_deploy 'd["JobVersion"] == 0 and d["Status"] == "successful"'
   run_job v1
@@ -164,7 +167,7 @@ setup_nocanary() {
   setup_canary
   nomad deployment promote "$(get /v1/job/$JOB/deployment | jq_ 'd["ID"]')" >/dev/null
   wait_deploy 'd["JobVersion"] == 1 and d["Status"] == "successful"'
-  wait_until "sum(1 for a in d if a['DesiredStatus'] == 'run' and a['ClientStatus'] in ('pending', 'running')) == 2" "/v1/job/$JOB/allocations" "2 live allocs"
+  wait_until "sum(1 for a in d if a['DesiredStatus'] == 'run' and a['ClientStatus'] in ('pending', 'running')) == $COUNT" "/v1/job/$JOB/allocations" "$COUNT live allocs"
   sleep 2
 }
 
@@ -186,12 +189,12 @@ import json, sys
 live = [a for a in json.load(sys.stdin) if a["DesiredStatus"] == "run" and a["ClientStatus"] in ("pending", "running")]
 canary = sum(1 for a in live if (a.get("DeploymentStatus") or {}).get("Canary"))
 old = sum(1 for a in live if a["JobVersion"] == 0)
-print("%d live (%d of v0, %d of v1, %d of them canary); count is 2" % (len(live), old, len(live) - old, canary))
-'
+print("%d live (%d of v0, %d of v1, %d of them canary); count is %s" % (len(live), old, len(live) - old, canary, sys.argv[1]))
+' "$COUNT"
 }
 
 job_status() {
-  nomad job status "$JOB" 2>/dev/null | awk '/^Summary/{p=1} /^Allocations/{p=0} p && NF' | indent
+  nomad job status "$JOB" 2>/dev/null | grep -v '^$' | indent
 }
 
 # ---------------------------------------------------------------- capacity layout
@@ -214,13 +217,14 @@ for n in nodes:
 ids = {n["Name"]: n["ID"] for n in nodes}
 cands = []
 for name, allocs in mine.items():
+    has_canary = any((a.get("DeploymentStatus") or {}).get("Canary", False) for a in allocs)
     for a in allocs:
         canary = (a.get("DeploymentStatus") or {}).get("Canary", False)
         if mode == "canary" and (canary or a["Job"]["Version"] != 0):
             continue
-        cands.append((len(allocs), name, a["ID"]))
+        cands.append((has_canary, len(allocs), name, a["ID"]))
 cands.sort()
-_, D, old = cands[0]
+_, _, D, old = cands[0]
 others = sorted((len(mine[n]), n) for n in mine if n != D)
 T, U = others[0][1], others[1][1]
 print("D_NAME=%s" % D)
@@ -256,6 +260,19 @@ ballast() { # t_slots u_slots
 
 # ---------------------------------------------------------------- the drain and the race
 
+# Waits for the drainer to flag one of the job's allocs on D for migration (max_parallel
+# is 1, so it picks one); sets OLD_ALLOC to it.
+wait_flagged() {
+  local i
+  for i in $(seq 1 100); do
+    OLD_ALLOC=$(get "/v1/node/$D_ID/allocations" | jq_ 'next((a["ID"] for a in d if a["JobID"] == "'"$JOB"'" and a["DesiredTransition"].get("Migrate") is True), "")' 2>/dev/null || true)
+    [ -n "$OLD_ALLOC" ] && return
+    sleep 0.2
+  done
+  echo "!! timed out waiting for the drainer to flag an alloc" >&2
+  return 1
+}
+
 # Drain D. $1 = yes: race rival jobs against the drain eval. Sets SINCE and BASE.
 drain() {
   local i
@@ -263,6 +280,7 @@ drain() {
   BASE=$(get "/v1/job/$JOB/evaluations" | jq_ 'max([e["ModifyIndex"] for e in d] or [0])')
   if [ "$1" = no ]; then
     nomad node drain -enable -yes -detach "$D_ID" >/dev/null
+    wait_flagged
     return
   fi
   case "$ALIGN" in
@@ -271,7 +289,7 @@ drain() {
       nomad node drain -enable -yes -detach "$D_ID" >/dev/null
       # The drainer flags the alloc and creates its evals in one raft write; the
       # paused broker holds them until it is resumed.
-      WAIT_STEP=0.2 WAIT_TRIES=100 wait_until "d['DesiredTransition'].get('Migrate') is True" "/v1/allocation/$OLD_ALLOC" "the drainer to flag the alloc"
+      wait_flagged
       WAIT_STEP=0.2 WAIT_TRIES=100 wait_until "any(e['Status'] == 'pending' and e['CreateIndex'] > $BASE for e in d)" "/v1/job/$JOB/evaluations" "the drain eval"
       for i in $(seq 1 "$RIVALS"); do filler "rival-$i" 70 -var "memory=$SLOT"; done
       nomad operator scheduler set-config -pause-eval-broker=false >/dev/null
@@ -441,10 +459,24 @@ scenario() {
   server_log > "$OUT/server-$tag.log"
 
   if [ "$mode" = canary ] && [ "$kind" != clean ]; then
+    say "[$tag] drained node $D_NAME back (drain disabled, eligible again): does the job reconcile?"
+    SINCE3=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    nomad node drain -disable -yes "$D_ID" >/dev/null
+    nomad node eligibility -enable "$D_ID" >/dev/null
+    sleep 15
+    note "-- server log since the node was re-enabled (nothing means no eval ran for the job)"
+    eval_log "$SINCE3" | indent
+    note "-- nomad eval list -job $JOB"
+    nomad eval list -job "$JOB" 2>/dev/null | grep -v '^$\|^==>' | indent
+    note "-- blocked evals for $JOB: $(blocked_evals); running: $(running $JOB)"
+    job_status
+    note "-- $(live_summary)"
+    server_log > "$OUT/server-$tag.log"
+
     say "[$tag] nomad deployment promote"
     nomad deployment promote "$(get /v1/job/$JOB/deployment | jq_ 'd["ID"]')" 2>&1 | grep -v '^$\|^==>' | indent
     wait_deploy 'd["Status"] == "successful"'
-    wait_until "sum(1 for a in d if a['DesiredStatus'] == 'run' and a['ClientStatus'] in ('pending', 'running')) == 2" "/v1/job/$JOB/allocations" "2 live allocs"
+    wait_until "sum(1 for a in d if a['DesiredStatus'] == 'run' and a['ClientStatus'] in ('pending', 'running')) == $COUNT" "/v1/job/$JOB/allocations" "$COUNT live allocs"
     sleep 2
     note "-- allocs after the promotion"
     allocs | indent
@@ -467,10 +499,10 @@ case "$cmd" in
   sched-nocanary) scenario nocanary sched-fail ;;
   all)
     up
-    scenario canary sched-fail
-    scenario nocanary sched-fail
     scenario canary plan-reject
     scenario nocanary plan-reject
+    scenario canary sched-fail
+    scenario nocanary sched-fail
     scenario canary clean
     clean
     if [ "${CDPP_KEEP_UP:-0}" != 1 ]; then down; fi

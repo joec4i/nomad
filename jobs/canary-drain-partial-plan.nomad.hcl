@@ -13,12 +13,12 @@ variable "marker" {
 
 variable "count" {
   type    = number
-  default = 2
+  default = 5
 }
 
 variable "memory" {
   type    = number
-  default = 300
+  default = 100
 }
 
 job "canary-drain" {
