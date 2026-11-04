@@ -1,6 +1,6 @@
 # Nomad: a drain migration left unplaced while a canary awaits promotion is never retried
 
-A self-contained docker-compose reproduction (3 Nomad servers and 3 clients, servers at DEBUG) of a scheduler bug. Related issue: [hashicorp/nomad#8671](https://github.com/hashicorp/nomad/issues/8671). Fix PR: [hashicorp/nomad#28730](https://github.com/hashicorp/nomad/pull/28730).
+A self-contained docker-compose reproduction (3 Nomad servers and 3 clients, servers at DEBUG) of a scheduler bug. Issue: [hashicorp/nomad#28738](https://github.com/hashicorp/nomad/issues/28738). Fix PR: [hashicorp/nomad#28730](https://github.com/hashicorp/nomad/pull/28730). Related: [hashicorp/nomad#8671](https://github.com/hashicorp/nomad/issues/8671).
 
 ## The bug
 
