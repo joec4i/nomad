@@ -9,7 +9,7 @@
 #                created.
 #   sched-fail   no node fits at scheduling time; the stop is kept (it is not popped
 #                for a migration) and a blocked eval is created. The stop itself frees
-#                capacity, which unblocks that eval within ~150 ms, and the re-run
+#                capacity, which unblocks that eval within ~200 ms, and the re-run
 #                places 0.
 #
 # Expects docker-compose.yml; `up` and `all` start it.
@@ -21,6 +21,12 @@
 #   scripts/canary-drain-partial-plan.sh clean-migration  control: pending canary, no rejection
 #   scripts/canary-drain-partial-plan.sh sched-bug        sched-fail, pending canary
 #   scripts/canary-drain-partial-plan.sh sched-nocanary   sched-fail, control without a pending canary
+#
+# Each scenario ends with a RESULT line: "ok" when the job ended in the expected state
+# (COUNT allocs of the right version, checked before any promotion), "BUG" when it did
+# not. Exit status: 0 ok, 1 BUG (or an error), 2 the trigger was not hit. `all` runs
+# every scenario, prints the RESULT lines, and exits 0 only if all are ok, so it fails
+# on stock Nomad and passes on a fixed build.
 #
 # How the plan-apply rejection is made (a natural race, no Nomad changes):
 #   - 3 clients advertise 1000 MB. Ballast jobs leave the migration target T with
@@ -41,6 +47,7 @@
 # (default hashicorp/nomad:2.1.1), CDPP_PROJECT (compose project, canarydrain),
 # CDPP_NOMAD_PORT (host port of the API, 34646).
 set -euo pipefail
+SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 cd "$(dirname "$0")/.."
 
 PROJECT=${CDPP_PROJECT:-canarydrain}
@@ -75,7 +82,7 @@ mkdir -p "$OUT"
 
 up() {
   say "starting the lab (project $PROJECT, API $API)"
-  compose up -d >/dev/null 2>&1
+  quiet compose up -d
   wait_nodes any
   clean # a cluster left over from an earlier run may have a drained node or old jobs
   note "$(nomad version | head -1); $(get /v1/nodes | jq_ 'len(d)') clients ready; servers: $(nomad server members 2>/dev/null | awk 'NR>1 && NF>6 {printf "%s(%s) ", $1, ($5=="true"?"leader":"follower")}')"
@@ -197,6 +204,26 @@ job_status() {
   nomad job status "$JOB" 2>/dev/null | grep -v '^$' | indent
 }
 
+# Did the job end in the expected state? With a pending canary: COUNT old allocs plus
+# the canary. Without: COUNT allocs, all of the new version. Sets RESULT and RESULT_RC
+# (0 ok, 1 BUG) and writes $OUT/result-<tag>.txt.
+verdict() { # tag mode
+  RESULT=$(get "/v1/job/$JOB/allocations" | python3 -I -c '
+import json, sys
+tag, mode, count = sys.argv[1], sys.argv[2], int(sys.argv[3])
+live = [a for a in json.load(sys.stdin) if a["DesiredStatus"] == "run" and a["ClientStatus"] in ("pending", "running")]
+old = sum(1 for a in live if a["JobVersion"] == 0)
+canary = sum(1 for a in live if (a.get("DeploymentStatus") or {}).get("Canary"))
+if mode == "canary":
+    ok, want = old == count and canary == 1, "%d of v0 plus the canary" % count
+else:
+    ok, want = old == 0 and len(live) == count, "%d of v1" % count
+print("%-21s %-3s  live: %d of v0, %d of v1 (%d canary); expected %s" % (tag + ":", "ok" if ok else "BUG", old, len(live) - old, canary, want))
+' "$1" "$2" "$COUNT")
+  case "$RESULT" in *" ok "*) RESULT_RC=0 ;; *) RESULT_RC=1 ;; esac
+  echo "$RESULT" > "$OUT/result-$1.txt"
+}
+
 # ---------------------------------------------------------------- capacity layout
 
 # Picks D (node to drain: hosts an old, non-canary alloc when $1 = canary), T (the
@@ -260,8 +287,9 @@ ballast() { # t_slots u_slots
 
 # ---------------------------------------------------------------- the drain and the race
 
-# Waits for the drainer to flag one of the job's allocs on D for migration (max_parallel
-# is 1, so it picks one); sets OLD_ALLOC to it.
+# Waits for the drainer to flag the job's allocs on D for migration; sets OLD_ALLOC to
+# one of them. With a pending canary the drainer flags both of D's old allocs at once
+# (the healthy canary counts towards migrate.max_parallel's budget); without one, one.
 wait_flagged() {
   local i
   for i in $(seq 1 100); do
@@ -437,8 +465,9 @@ scenario() {
   server_log > "$OUT/server-$tag.log"
   if [ "$hit" != yes ]; then
     evidence "[$tag] NOT reproduced in $max attempts"
+    printf '%-21s %s\n' "$tag:" "not triggered in $max attempts" > "$OUT/result-$tag.txt"
     echo "!! [$tag] no hit in $max attempts" >&2
-    return 1
+    return 2
   fi
   evidence "[$tag] right after the drain, attempt $attempt"
 
@@ -471,6 +500,7 @@ scenario() {
     note "-- blocked evals for $JOB: $(blocked_evals); running: $(running $JOB)"
     job_status
     note "-- $(live_summary)"
+    verdict "$tag" "$mode"
     server_log > "$OUT/server-$tag.log"
 
     say "[$tag] nomad deployment promote"
@@ -482,7 +512,11 @@ scenario() {
     allocs | indent
     job_status
     note "-- $(live_summary)"
+  else
+    verdict "$tag" "$mode"
   fi
+  say "RESULT $RESULT"
+  return "$RESULT_RC"
 }
 
 # ---------------------------------------------------------------- main
@@ -499,13 +533,20 @@ case "$cmd" in
   sched-nocanary) scenario nocanary sched-fail ;;
   all)
     up
-    scenario canary plan-reject
-    scenario nocanary plan-reject
-    scenario canary sched-fail
-    scenario nocanary sched-fail
-    scenario canary clean
+    rm -f "$OUT"/result-*.txt
+    # Each scenario runs as its own process, so one that fails or misses its trigger
+    # does not stop the rest (set -e does not apply inside a function called with ||).
+    rc=0
+    for s in bug nocanary sched-bug sched-nocanary clean-migration; do
+      "$SELF" "$s" || rc=1
+    done
     clean
+    say "results (BUG: the job did not end in the expected state; stock Nomad shows it in the two canary bug scenarios)"
+    for t in canary-plan-reject nocanary-plan-reject canary-sched-fail nocanary-sched-fail canary-clean; do
+      cat "$OUT/result-$t.txt" 2>/dev/null || printf '%-21s %s\n' "$t:" "no result, the scenario failed with an error"
+    done | indent
     if [ "${CDPP_KEEP_UP:-0}" != 1 ]; then down; fi
+    exit "$rc"
     ;;
   *) echo "usage: $0 all|up|down|clean|bug|nocanary|clean-migration|sched-bug|sched-nocanary" >&2; exit 1 ;;
 esac

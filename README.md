@@ -179,23 +179,26 @@ scripts/canary-drain-partial-plan.sh down         # tear down (also `up`, `clean
 
 The image defaults to `hashicorp/nomad:2.1.1`; set `CDPP_NOMAD_IMAGE` to use another. Each scenario prints the server log lines of the job's evals, the allocs, and `nomad job status` output. The merged server logs are kept in `out/`.
 
+Each scenario ends with a `RESULT` line. It says `ok` when the job ended in the expected state, checked before any promotion: 5 old allocs plus the canary with a pending canary, or 5 new-version allocs without one. Otherwise it says `BUG`. `all` prints the five lines at the end and exits 0 only if all are `ok`. Stock Nomad fails `all`; a fixed build passes it.
+
 ## Manual reproduction (sched-fail)
 
 The sched-fail case needs no race, so it can be done by hand against the compose cluster:
 
-1. `docker compose up -d`, then `export NOMAD_ADDR=http://127.0.0.1:34646` (or run `nomad` inside the `nomad-server` container).
-2. `nomad job run -var marker=v0 jobs/canary-drain-partial-plan.nomad.hcl`, and wait for the deployment to be `successful`.
-3. `nomad job run -var marker=v1 jobs/canary-drain-partial-plan.nomad.hcl`. Wait until the canary is healthy and the deployment says `requires manual promotion`. Do not promote it.
+1. From the repository root, `docker compose up -d`. No local `nomad` binary is needed: `alias nomad='docker compose exec -T nomad-server nomad'`. Job files are passed on stdin (`-`), so the commands below also work with a local binary and `export NOMAD_ADDR=http://127.0.0.1:34646`.
+2. `nomad job run -var marker=v0 - < jobs/canary-drain-partial-plan.nomad.hcl`, and wait for the deployment to be `successful`.
+3. `nomad job run -var marker=v1 - < jobs/canary-drain-partial-plan.nomad.hcl`. Wait until the canary is healthy and the deployment says `requires manual promotion`. Do not promote it.
 4. In `nomad job status canary-drain`, pick a node to drain that has old (version 0) allocs and not the canary.
-5. Fill the other two nodes completely: for each, register a job from `jobs/canary-drain-partial-plan-filler.nomad.hcl` (replace `__ID__` with a job id and `__PRIORITY__` with `50`) with `-var node=<name> -var memory=<MB>`, where `<MB>` is 1000 minus the memory already allocated on that node (100 per `canary-drain` alloc; see `nomad node status <node>`).
+5. Fill the other two nodes completely. For each one, run `sed 's/__ID__/ballast-<name>/; s/__PRIORITY__/50/' jobs/canary-drain-partial-plan-filler.nomad.hcl | nomad job run -var node=<name> -var memory=<MB> -`, where `<MB>` is 1000 minus the memory already allocated on that node (100 per `canary-drain` alloc; see `nomad node status <node>`).
 6. `nomad node drain -enable -yes -detach <node to drain>`.
-7. `nomad job status canary-drain` shows the drained old allocs as `stop`/`complete` with no replacements, and the server log has `failed to place all allocations, blocked eval created`. The blocked eval has already re-run by then (the stops on the drained node freed capacity and unblocked it within ~100 ms) and reconciled `place=0`. Stop the filler jobs to free capacity on the other nodes: no eval is triggered, and nothing is placed until you run `nomad deployment promote`.
+7. `nomad job status canary-drain` shows the drained old allocs as `stop`/`complete` with no replacements, and the server log (`docker compose logs nomad-server nomad-server2 nomad-server3`) has `failed to place all allocations, blocked eval created`. By then the blocked eval has already re-run and reconciled `place=0`: the stops on the drained node freed capacity, which unblocked it within ~200 ms.
+8. Stop the filler jobs and put the node back (`nomad node drain -disable -yes <node>`). No eval is triggered, and nothing is placed until you run `nomad deployment promote`.
 
 The plan-reject case needs two plans to compete for the same slot at the same moment; use the script for that (see below).
 
 ## Scenarios
 
-`all` runs these in order and takes about 5 minutes. The two canary bug scenarios end by promoting the deployment, which fills the empty slots; the results below are taken before that.
+`all` runs these in order and takes about 5 minutes. The two canary bug scenarios end by promoting the deployment, which fills the empty slots; the results below are taken before that. Both columns are from real runs, the patched one with the fix PR's branch at `1550917f5e`.
 
 | Scenario | Single-scenario command | Stock Nomad | Patched build |
 |---|---|---|---|
